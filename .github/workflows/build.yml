@@ -102,7 +102,7 @@ jobs:
 
               <application
                   android:allowBackup="false"
-                  android:label="Personal AI"
+                  android:label="DEV"
                   android:theme="@android:style/Theme.DeviceDefault.Light">
 
                   <activity
@@ -122,7 +122,7 @@ jobs:
                   <service
                       android:name=".PhoneControlService"
                       android:exported="true"
-                      android:label="Personal AI"
+                      android:label="DEV"
                       android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
                       <intent-filter>
                           <action android:name="android.accessibilityservice.AccessibilityService" />
@@ -137,7 +137,7 @@ jobs:
           mkdir -p app/src/main/res/values
           cat > app/src/main/res/values/strings.xml <<'EOF_PAI'
           <resources>
-              <string name="acc_desc">Personal AI aapke bolne par screen padhta hai aur tap, type ya scroll karta hai.</string>
+              <string name="acc_desc">DEV aapke bolne par screen padhta hai aur tap, type ya scroll karta hai.</string>
           </resources>
           EOF_PAI
           mkdir -p app/src/main/res/xml
@@ -170,7 +170,7 @@ jobs:
               // AI ka naam jo aapne rakha hai
               fun aiName(c: Context): String {
                   val n = (sp(c).getString("ai_name", "") ?: "").trim()
-                  return if (n.isEmpty()) "Jarvis" else n
+                  return if (n.isEmpty()) "DEV" else n
               }
 
               // "Naam sikhao" se sune hue roop (Hindi / English spelling)
@@ -238,7 +238,7 @@ jobs:
                   fun label(t: String) = TextView(this).apply { text = t; textSize = 15f; setPadding(0, 28, 0, 6) }
                   fun button(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }
 
-                  root.addView(TextView(this).apply { text = "Personal AI"; textSize = 24f })
+                  root.addView(TextView(this).apply { text = "DEV"; textSize = 24f })
 
                   root.addView(label("1. à¤…à¤ªà¤¨à¥‡ AI à¤•à¤¾ à¤¨à¤¾à¤® (à¤œà¥‹ à¤®à¤¨ à¤šà¤¾à¤¹à¥‡ à¤°à¤–à¥‹)"))
                   nameBox = EditText(this).apply { setText(Prefs.aiName(this@MainActivity)) }
@@ -283,7 +283,7 @@ jobs:
                   })
 
                   root.addView(label("4. à¤ªà¤¹à¤²à¥€ à¤¬à¤¾à¤° à¤¯à¥‡ 3 permissions à¤¦à¥‹:"))
-                  root.addView(button("(a) Accessibility à¤šà¤¾à¤²à¥‚ à¤•à¤°à¥‹ (Personal AI)") {
+                  root.addView(button("(a) Accessibility à¤šà¤¾à¤²à¥‚ à¤•à¤°à¥‹ (DEV)") {
                       startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                   })
                   root.addView(button("(b) Display over other apps allow à¤•à¤°à¥‹") {
@@ -304,7 +304,7 @@ jobs:
               private fun save() {
                   val sp = Prefs.sp(this)
                   val oldName = Prefs.aiName(this)
-                  val newName = nameBox.text.toString().trim().ifEmpty { "Jarvis" }
+                  val newName = nameBox.text.toString().trim().ifEmpty { "DEV" }
                   val e = sp.edit()
                       .putString("ai_name", newName)
                       .putString("key", keyBox.text.toString().trim())
@@ -413,4 +413,704 @@ jobs:
           import android.speech.RecognizerIntent
           import android.speech.SpeechRecognizer
           import android.speech.tts.TextToSpeech
-          import android.speech.
+          import android.speech.tts.UtteranceProgressListener
+          import android.widget.Toast
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.concurrent.Executors
+
+          class AssistantService : Service(), TextToSpeech.OnInitListener {
+              companion object {
+                  private const val CHANNEL = "assistant"
+                  private val STOP_WORDS = listOf("alvida", "अलविदा", "bye bye", "बाय बाय", "sleep mode")
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private val worker = Executors.newSingleThreadExecutor()
+              private var recognizer: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+              private var running = false
+              private var busy = false
+
+              @Volatile
+              private var awaitingCommand = false
+              private var wakeLock: PowerManager.WakeLock? = null
+              private val history = ArrayList<JSONObject>()
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (running) return START_STICKY
+                  running = true
+                  createChannel()
+                  val n = buildNotice("नाम लेकर बुलाइए")
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  } else {
+                      startForeground(1, n)
+                  }
+                  val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                  wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "personalai:listen").apply { acquire() }
+                  tts = TextToSpeech(this, this)
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  main.removeCallbacksAndMessages(null)
+                  recognizer?.destroy()
+                  recognizer = null
+                  tts?.stop()
+                  tts?.shutdown()
+                  tts = null
+                  worker.shutdownNow()
+                  wakeLock?.let { if (it.isHeld) it.release() }
+                  super.onDestroy()
+              }
+
+              // ---------- Notification ----------
+              private fun createChannel() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CHANNEL, "Assistant", NotificationManager.IMPORTANCE_LOW))
+              }
+
+              private fun buildNotice(text: String): Notification {
+                  val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                  return Notification.Builder(this, CHANNEL)
+                      .setContentTitle(Prefs.aiName(this) + " सुन रहा है")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setContentIntent(open)
+                      .setOngoing(true)
+                      .build()
+              }
+
+              private fun notice(text: String) {
+                  getSystemService(NotificationManager::class.java).notify(1, buildNotice(text))
+              }
+
+              // ---------- Voice out ----------
+              override fun onInit(status: Int) {
+                  if (status != TextToSpeech.SUCCESS) {
+                      ttsReady = false
+                      startListening()
+                      return
+                  }
+                  val t = tts ?: return
+                  val r = t.setLanguage(Locale("hi", "IN"))
+                  if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+                      t.setLanguage(Locale("en", "IN"))
+                  }
+                  t.setSpeechRate(Prefs.rate(this))
+                  t.setPitch(Prefs.pitch(this))
+                  t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(utteranceId: String?) {}
+                      override fun onDone(utteranceId: String?) {
+                          main.post { busy = false; startListening() }
+                      }
+
+                      @Deprecated("Deprecated in Java")
+                      override fun onError(utteranceId: String?) {
+                          main.post { busy = false; startListening() }
+                      }
+                  })
+                  ttsReady = true
+                  speak("नमस्ते, मैं ${Prefs.aiName(this)} हूँ। मुझे मेरा नाम लेकर बुलाइए।")
+              }
+
+              private fun speak(text: String) {
+                  main.post {
+                      if (!running) return@post
+                      val t = tts
+                      if (!ttsReady || t == null) {
+                          busy = false
+                          startListening()
+                          return@post
+                      }
+                      busy = true
+                      recognizer?.destroy()
+                      recognizer = null
+                      t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u" + System.nanoTime())
+                  }
+              }
+
+              // ---------- Voice in ----------
+              private val listener = object : RecognitionListener {
+                  override fun onReadyForSpeech(params: Bundle?) {}
+                  override fun onBeginningOfSpeech() {}
+                  override fun onRmsChanged(rmsdB: Float) {}
+                  override fun onBufferReceived(buffer: ByteArray?) {}
+                  override fun onEndOfSpeech() {}
+                  override fun onPartialResults(partialResults: Bundle?) {}
+                  override fun onEvent(eventType: Int, params: Bundle?) {}
+
+                  override fun onError(error: Int) {
+                      if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                          stopSelf()
+                          return
+                      }
+                      main.postDelayed({ startListening() }, 600)
+                  }
+
+                  override fun onResults(results: Bundle?) {
+                      val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
+                      if (text.isBlank()) main.postDelayed({ startListening() }, 300) else onHeard(text)
+                  }
+              }
+
+              private fun startListening() {
+                  main.post {
+                      if (!running || busy) return@post
+                      if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                          Toast.makeText(this, "Speech recognition नहीं मिला (Google app चाहिए)", Toast.LENGTH_LONG).show()
+                          return@post
+                      }
+                      recognizer?.destroy()
+                      val r = SpeechRecognizer.createSpeechRecognizer(this)
+                      r.setRecognitionListener(listener)
+                      recognizer = r
+                      val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
+                          .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                      r.startListening(i)
+                  }
+              }
+
+              private fun onHeard(text: String) {
+                  notice("सुना: $text")
+                  val lower = text.lowercase()
+                  val names = Prefs.names(this)
+                  val hit = names.any { lower.contains(it) }
+                  if (!hit && !awaitingCommand) {
+                      startListening()
+                      return
+                  }
+                  var cmd = lower
+                  for (n in names) cmd = cmd.replace(n, "")
+                  cmd = cmd.trim(' ', ',', '.', '?', '!', '।')
+                  awaitingCommand = false
+                  if (cmd.isEmpty()) {
+                      awaitingCommand = true
+                      speak("जी, बोलिए।")
+                      return
+                  }
+                  if (STOP_WORDS.any { cmd.contains(it) }) {
+                      speak("ठीक है, फिर मिलते हैं।")
+                      main.postDelayed({ stopSelf() }, 4000)
+                      return
+                  }
+                  busy = true
+                  worker.execute {
+                      val answer = try {
+                          ask(cmd)
+                      } catch (e: Exception) {
+                          val m = e.message ?: ""
+                          when {
+                              m.contains("API key not valid") || m.contains("API_KEY_INVALID") -> "API key गलत लग रही है।"
+                              m.contains("429") -> "अभी की free limit पूरी हो गई है, थोड़ी देर बाद कोशिश कीजिए।"
+                              m.contains("503") || m.contains("500") -> "अभी Gemini व्यस्त है, थोड़ी देर बाद कोशिश कीजिए।"
+                              m.contains("404") -> "मॉडल का नाम सही नहीं है, app में मॉडल बदलिए।"
+                              else -> "इंटरनेट या API में दिक्कत है।"
+                          }
+                      }
+                      if (answer.contains("?")) awaitingCommand = true
+                      speak(answer)
+                  }
+              }
+
+              // ---------- Gemini ----------
+              private fun systemPrompt(): String {
+                  val now = SimpleDateFormat("EEEE, d MMMM yyyy, HH:mm", Locale("en", "IN")).format(Date())
+                  val name = Prefs.aiName(this)
+                  return "Tumhara naam $name hai. Tum user ke Android phone me chalne wale voice assistant ho. " +
+                      "Abhi ka samay: $now. " +
+                      "Jawab user ki bhasha me do; Hindi ho to Devanagari me likho taaki awaaz sahi bole. " +
+                      "Jawab bolne ke liye hain: 1-3 chhote vakya, koi markdown, list ya emoji nahi. " +
+                      "Taaza khabar ya current jankari ke liye web_search tool use karo. " +
+                      "Phone ka kaam tools se karo. Screen par kuch karne se pehle read_screen se dekho ki kya dikh raha hai. " +
+                      "Koi bhi aisa kaam jo wapas nahi hota (call karna, message bhejna, kuch delete ya post karna) " +
+                      "karne se pehle user se chhota haan/na ka sawaal poochho (sawaal ? par khatam karo) aur sirf haan milne par karo. " +
+                      "Payment, banking, UPI, OTP ya password se jude kaam kabhi mat karo, aur kisi ka OTP ya password bolkar mat sunao."
+              }
+
+              private fun msg(role: String, text: String) =
+                  JSONObject().put("role", role).put("parts", JSONArray().put(JSONObject().put("text", text)))
+
+              private fun ask(question: String): String {
+                  val key = Prefs.apiKey(this)
+                  if (key.isBlank()) return "पहले app में Gemini API key डालिए।"
+                  val model = Prefs.model(this)
+                  val contents = JSONArray()
+                  history.forEach { contents.put(it) }
+                  contents.put(msg("user", question))
+                  var answer = ""
+                  for (step in 0 until 8) {
+                      val body = JSONObject()
+                          .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemPrompt()))))
+                          .put("contents", contents)
+                          .put("tools", Gemini.tools())
+                      val resp = Gemini.post(key, model, body)
+                      val content = resp.optJSONArray("candidates")?.optJSONObject(0)?.optJSONObject("content")
+                      val parts = content?.optJSONArray("parts")
+                      if (content == null || parts == null || parts.length() == 0) {
+                          answer = "इस बार जवाब नहीं मिल पाया, दोबारा बोलिए।"
+                          break
+                      }
+                      if (!content.has("role")) content.put("role", "model")
+                      contents.put(content)
+
+                      val calls = ArrayList<JSONObject>()
+                      val sb = StringBuilder()
+                      for (i in 0 until parts.length()) {
+                          val p = parts.getJSONObject(i)
+                          if (p.has("functionCall")) {
+                              calls.add(p.getJSONObject("functionCall"))
+                          } else if (p.has("text") && !p.optBoolean("thought", false)) {
+                              sb.append(p.optString("text"))
+                          }
+                      }
+                      if (calls.isEmpty()) {
+                          answer = sb.toString().trim()
+                          break
+                      }
+                      val responses = JSONArray()
+                      for (c in calls) {
+                          val name = c.getString("name")
+                          val args = c.optJSONObject("args") ?: JSONObject()
+                          val out = try {
+                              if (name == "web_search") Gemini.search(key, model, args.optString("query"))
+                              else Actions.execute(this, name, args)
+                          } catch (e: Exception) {
+                              "error: " + e.message
+                          }
+                          val fr = JSONObject().put("name", name).put("response", JSONObject().put("result", out))
+                          if (c.has("id")) fr.put("id", c.getString("id"))
+                          responses.put(JSONObject().put("functionResponse", fr))
+                      }
+                      contents.put(JSONObject().put("role", "user").put("parts", responses))
+                  }
+                  if (answer.isEmpty()) answer = "हो गया।"
+                  history.add(msg("user", question))
+                  history.add(msg("model", answer))
+                  while (history.size > 20) history.removeAt(0)
+                  return answer
+              }
+          }
+          EOF_PAI
+          mkdir -p app/src/main/java/com/example/personalai
+          cat > app/src/main/java/com/example/personalai/Gemini.kt <<'EOF_PAI'
+          package com.example.personalai
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object Gemini {
+              private const val BASE = "https://generativelanguage.googleapis.com/v1beta/models/"
+
+              @Volatile
+              private var thinkingOk = true
+
+              private fun rawPost(key: String, model: String, body: JSONObject): JSONObject {
+                  val c = URL(BASE + model + ":generateContent").openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"
+                  c.connectTimeout = 20000
+                  c.readTimeout = 90000
+                  c.setRequestProperty("x-goog-api-key", key)
+                  c.setRequestProperty("Content-Type", "application/json")
+                  c.doOutput = true
+                  c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                  val code = c.responseCode
+                  val stream = if (code in 200..299) c.inputStream else c.errorStream
+                  val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+                  if (code !in 200..299) throw RuntimeException("API $code: $text")
+                  return JSONObject(text)
+              }
+
+              // Gemini 3 models ke liye "low" thinking (jaldi jawab). Agar server mana kare to bina uske dobara try.
+              fun post(key: String, model: String, body: JSONObject): JSONObject {
+                  val wantThinking = thinkingOk && model.startsWith("gemini-3")
+                  if (wantThinking) {
+                      body.put(
+                          "generationConfig",
+                          JSONObject().put("thinkingConfig", JSONObject().put("thinkingLevel", "low"))
+                      )
+                  } else {
+                      body.remove("generationConfig")
+                  }
+                  try {
+                      return rawPost(key, model, body)
+                  } catch (e: RuntimeException) {
+                      val m = e.message ?: ""
+                      if (wantThinking && m.contains("API 400") && m.contains("think", ignoreCase = true)) {
+                          thinkingOk = false
+                          body.remove("generationConfig")
+                          return rawPost(key, model, body)
+                      }
+                      throw e
+                  }
+              }
+
+              private fun textParts(t: String) =
+                  JSONObject().put("parts", JSONArray().put(JSONObject().put("text", t)))
+
+              // Google Search se taaza jankari (alag request, sirf search tool ke saath)
+              fun search(key: String, model: String, query: String): String {
+                  val body = JSONObject()
+                      .put("systemInstruction", textParts("Taaza jankari ke saath 4-5 chhote vakya me jawab do. Hindi me likho."))
+                      .put(
+                          "contents",
+                          JSONArray().put(
+                              JSONObject().put("role", "user")
+                                  .put("parts", JSONArray().put(JSONObject().put("text", query)))
+                          )
+                      )
+                      .put("tools", JSONArray().put(JSONObject().put("google_search", JSONObject())))
+                  val resp = post(key, model, body)
+                  val parts = resp.optJSONArray("candidates")?.optJSONObject(0)
+                      ?.optJSONObject("content")?.optJSONArray("parts") ?: return "kuch nahi mila"
+                  val sb = StringBuilder()
+                  for (i in 0 until parts.length()) sb.append(parts.getJSONObject(i).optString("text"))
+                  val out = sb.toString().trim()
+                  return if (out.isEmpty()) "kuch nahi mila" else out
+              }
+
+              private fun str(d: String) = JSONObject().put("type", "STRING").put("description", d)
+              private fun int(d: String) = JSONObject().put("type", "INTEGER").put("description", d)
+              private fun bool(d: String) = JSONObject().put("type", "BOOLEAN").put("description", d)
+              private fun opts(d: String, vararg v: String) =
+                  JSONObject().put("type", "STRING").put("description", d).put("enum", JSONArray(v.toList()))
+
+              private fun fn(name: String, desc: String, props: JSONObject? = null, req: List<String> = emptyList()): JSONObject {
+                  val o = JSONObject().put("name", name).put("description", desc)
+                  if (props != null) {
+                      val p = JSONObject().put("type", "OBJECT").put("properties", props)
+                      if (req.isNotEmpty()) p.put("required", JSONArray(req))
+                      o.put("parameters", p)
+                  }
+                  return o
+              }
+
+              fun tools(): JSONArray {
+                  val d = JSONArray()
+                  d.put(fn("web_search", "Search Google for current news and up-to-date facts.",
+                      JSONObject().put("query", str("Search query")), listOf("query")))    
+                  d.put(fn("open_app", "Open an installed app by its name (e.g. WhatsApp, YouTube, Camera, Settings).",
+                      JSONObject().put("app_name", str("App name as shown on the phone")), listOf("app_name")))
+                  d.put(fn("call", "Place a phone call to a saved contact name or a phone number. Use only after the user confirmed.",
+                      JSONObject().put("contact_or_number", str("Contact name or number")), listOf("contact_or_number")))
+                  d.put(fn("set_alarm", "Set an alarm at a time of day.",
+                      JSONObject().put("hour", int("0-23")).put("minute", int("0-59")).put("label", str("Optional label")),
+                      listOf("hour", "minute")))
+                  d.put(fn("set_timer", "Start a countdown timer.",
+                      JSONObject().put("seconds", int("Duration in seconds")).put("label", str("Optional label")),
+                      listOf("seconds")))
+                  d.put(fn("flashlight", "Turn the flashlight on or off.",
+                      JSONObject().put("on", bool("true = on")), listOf("on")))
+                  d.put(fn("volume", "Change media volume.",
+                      JSONObject().put("action", opts("Volume action", "up", "down", "max", "mute", "unmute")), listOf("action")))
+                  d.put(fn("media", "Control music or video playback.",
+                      JSONObject().put("action", opts("Playback action", "play_pause", "next", "previous")), listOf("action")))
+                  d.put(fn("system_action", "Press a system button or do a system gesture.",
+                      JSONObject().put("action", opts("Action", "home", "back", "recents", "notifications", "lock_screen", "screenshot")),
+                      listOf("action")))
+                  d.put(fn("read_screen", "Read the visible text on the current screen. Items marked [click] are tappable."))
+                  d.put(fn("click_text", "Tap the on-screen element that contains this text.",
+                      JSONObject().put("text", str("Visible text of the element")), listOf("text")))
+                  d.put(fn("type_text", "Type text into the currently focused input field (replaces its content).",
+                      JSONObject().put("text", str("Text to type")), listOf("text")))
+                  d.put(fn("scroll", "Scroll the current screen.",
+                      JSONObject().put("direction", opts("Direction", "up", "down")), listOf("direction")))
+                  return JSONArray().put(JSONObject().put("functionDeclarations", d))
+              }
+          }
+          EOF_PAI
+          mkdir -p app/src/main/java/com/example/personalai
+          cat > app/src/main/java/com/example/personalai/Actions.kt <<'EOF_PAI'
+          package com.example.personalai
+
+          import android.Manifest
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.provider.AlarmClock
+          import android.provider.ContactsContract
+          import android.view.KeyEvent
+          import org.json.JSONObject
+
+          object Actions {
+              // Basic safety: payment / banking style apps par kaam nahi karega.
+              private val BLOCKED_WORDS = listOf(
+                  "paisa", "phonepe", "paytm", "upi", "bhim", "bank", "wallet",
+                  "paypal", "razorpay", "mobikwik", "freecharge", "amazonpay"
+              )
+
+              fun isBlocked(pkg: String): Boolean {
+                  val p = pkg.lowercase()
+                  return BLOCKED_WORDS.any { p.contains(it) }
+              }
+
+              fun execute(ctx: Context, name: String, a: JSONObject): String = when (name) {
+                  "open_app" -> openApp(ctx, a.getString("app_name"))
+                  "call" -> call(ctx, a.getString("contact_or_number"))
+                  "set_alarm" -> setAlarm(ctx, a.getInt("hour"), a.getInt("minute"), a.optString("label", ""))
+                  "set_timer" -> setTimer(ctx, a.getInt("seconds"), a.optString("label", ""))
+                  "flashlight" -> flashlight(ctx, a.getBoolean("on"))
+                  "volume" -> volume(ctx, a.getString("action"))
+                  "media" -> media(ctx, a.getString("action"))
+                  "system_action" -> systemAction(a.getString("action"))
+                  "read_screen" -> withAcc { it.readScreen() }
+                  "click_text" -> withAcc { if (it.clickText(a.getString("text"))) "clicked" else "not found or blocked" }
+                  "type_text" -> withAcc { if (it.typeText(a.getString("text"))) "typed" else "no editable field focused" }
+                  "scroll" -> withAcc { if (it.scroll(a.getString("direction"))) "scrolled" else "cannot scroll" }
+                  else -> "unknown tool"
+              }
+
+              private fun withAcc(f: (PhoneControlService) -> String): String {
+                  val s = PhoneControlService.instance ?: return "Accessibility service chalu nahi hai"
+                  return f(s)
+              }
+
+              private fun start(ctx: Context, i: Intent) {
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  val c: Context = PhoneControlService.instance ?: ctx
+                  c.startActivity(i)
+              }
+
+              private fun openApp(ctx: Context, name: String): String {
+                  val pm = ctx.packageManager
+                  val q = name.lowercase().trim()
+                  val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                  val match = apps.firstOrNull { it.loadLabel(pm).toString().lowercase() == q }
+                      ?: apps.firstOrNull { it.loadLabel(pm).toString().lowercase().contains(q) }
+                      ?: return "app nahi mila: $name"
+                  val pkg = match.activityInfo.packageName
+                  if (isBlocked(pkg)) return "Ye app safety ke liye blocked hai"
+                  val li = pm.getLaunchIntentForPackage(pkg) ?: return "app khol nahi sakta"
+                  start(ctx, li)
+                  return "opened " + match.loadLabel(pm)
+              }
+
+              private fun findContact(ctx: Context, name: String): String? {
+                  val c = ctx.contentResolver.query(
+                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                      arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+                      ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?",
+                      arrayOf("%$name%"), null
+                  ) ?: return null
+                  var result: String? = null
+                  c.use { if (it.moveToFirst()) result = it.getString(0) }
+                  return result
+              }
+
+              private fun call(ctx: Context, target: String): String {
+                  var number = target.filter { it.isDigit() || it == '+' }
+                  if (number.length < 5) {
+                      if (ctx.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED)
+                          return "contacts permission nahi hai"
+                      number = findContact(ctx, target.trim()) ?: return "contact nahi mila: $target"
+                  }
+                  if (ctx.checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED)
+                      return "call permission nahi hai"
+                  start(ctx, Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(number))))
+                  return "calling $number"
+              }
+
+              private fun setAlarm(ctx: Context, h: Int, m: Int, label: String): String {
+                  val i = Intent(AlarmClock.ACTION_SET_ALARM)
+                      .putExtra(AlarmClock.EXTRA_HOUR, h)
+                      .putExtra(AlarmClock.EXTRA_MINUTES, m)
+                      .putExtra(AlarmClock.EXTRA_MESSAGE, label)
+                      .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                  start(ctx, i)
+                  return "alarm set for $h:$m"
+              }
+
+              private fun setTimer(ctx: Context, sec: Int, label: String): String {
+                  val i = Intent(AlarmClock.ACTION_SET_TIMER)
+                      .putExtra(AlarmClock.EXTRA_LENGTH, sec)
+                      .putExtra(AlarmClock.EXTRA_MESSAGE, label)
+                      .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                  start(ctx, i)
+                  return "timer set for $sec seconds"
+              }
+
+              private fun flashlight(ctx: Context, on: Boolean): String {
+                  val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                  val id = cm.cameraIdList.firstOrNull {
+                      cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                  } ?: return "flashlight nahi mili"
+                  cm.setTorchMode(id, on)
+                  return if (on) "torch on" else "torch off"
+              }
+
+              private fun volume(ctx: Context, action: String): String {
+                  val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  val s = AudioManager.STREAM_MUSIC
+                  when (action) {
+                      "up" -> am.adjustStreamVolume(s, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
+                      "down" -> am.adjustStreamVolume(s, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
+                      "max" -> am.setStreamVolume(s, am.getStreamMaxVolume(s), AudioManager.FLAG_SHOW_UI)
+                      "mute" -> am.adjustStreamVolume(s, AudioManager.ADJUST_MUTE, AudioManager.FLAG_SHOW_UI)
+                      "unmute" -> am.adjustStreamVolume(s, AudioManager.ADJUST_UNMUTE, AudioManager.FLAG_SHOW_UI)
+                      else -> return "unknown volume action"
+                  }
+                  return "ok"
+              }
+
+              private fun media(ctx: Context, action: String): String {
+                  val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  val code = when (action) {
+                      "play_pause" -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+                      "next" -> KeyEvent.KEYCODE_MEDIA_NEXT
+                      "previous" -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
+                      else -> return "unknown media action"
+                  }
+                  am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+                  am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+                  return "ok"
+              }
+
+              private fun systemAction(action: String): String {
+                  val s = PhoneControlService.instance ?: return "Accessibility service chalu nahi hai"
+                  val g = when (action) {
+                      "home" -> AccessibilityService.GLOBAL_ACTION_HOME
+                      "back" -> AccessibilityService.GLOBAL_ACTION_BACK
+                      "recents" -> AccessibilityService.GLOBAL_ACTION_RECENTS
+                      "notifications" -> AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS
+                      "lock_screen" -> AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN
+                      "screenshot" -> AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT
+                      else -> return "unknown system action"
+                  }
+                  return if (s.performGlobalAction(g)) "done" else "failed"
+              }
+          }
+          EOF_PAI
+          mkdir -p app/src/main/java/com/example/personalai
+          cat > app/src/main/java/com/example/personalai/PhoneControlService.kt <<'EOF_PAI'
+          package com.example.personalai
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.os.Bundle
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class PhoneControlService : AccessibilityService() {
+              companion object {
+                  @Volatile
+                  var instance: PhoneControlService? = null
+              }
+
+              override fun onServiceConnected() {
+                  instance = this
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onDestroy() {
+                  instance = null
+                  super.onDestroy()
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              private fun rootOrNull(): AccessibilityNodeInfo? {
+                  val r = rootInActiveWindow ?: return null
+                  if (Actions.isBlocked(r.packageName?.toString() ?: "")) return null
+                  return r
+              }
+
+              fun readScreen(): String {
+                  val root = rootInActiveWindow ?: return "screen padh nahi paya"
+                  if (Actions.isBlocked(root.packageName?.toString() ?: "")) return "Ye app safety ke liye blocked hai"
+                  val out = StringBuilder()
+                  var count = 0
+                  fun walk(n: AccessibilityNodeInfo?) {
+                      if (n == null || count > 80) return
+                      val t = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim()
+                      if (t.isNotEmpty() && !n.isPassword) {
+                          out.append(t)
+                          if (n.isClickable) out.append(" [click]")
+                          out.append('\n')
+                          count++
+                      }
+                      for (i in 0 until n.childCount) walk(n.getChild(i))
+                  }
+                  walk(root)
+                  return if (out.isEmpty()) "kuch text nahi dikha" else out.toString().take(3000)
+              }
+
+              fun clickText(t: String): Boolean {
+                  val root = rootOrNull() ?: return false
+                  for (n in root.findAccessibilityNodeInfosByText(t)) {
+                      var cur: AccessibilityNodeInfo? = n
+                      while (cur != null) {
+                          if (cur.isClickable) return cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                          cur = cur.parent
+                      }
+                  }
+                  return false
+              }
+
+              fun typeText(t: String): Boolean {
+                  val root = rootOrNull() ?: return false
+                  val f = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
+                  if (f.isPassword) return false
+                  val args = Bundle()
+                  args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, t)
+                  return f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+              }
+
+              fun scroll(direction: String): Boolean {
+                  val root = rootOrNull() ?: return false
+                  val node = findScrollable(root) ?: return false
+                  val action = if (direction == "up") AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                  else AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                  return node.performAction(action)
+              }
+
+              private fun findScrollable(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+                  if (n.isScrollable) return n
+                  for (i in 0 until n.childCount) {
+                      val c = n.getChild(i) ?: continue
+                      val r = findScrollable(c)
+                      if (r != null) return r
+                  }
+                  return null
+              }
+          }
+          EOF_PAI
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+      - name: APK banao
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DEV-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: DEV APK ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
