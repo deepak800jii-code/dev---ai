@@ -1,0 +1,416 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Project files banao
+        run: |
+          mkdir -p .
+          cat > settings.gradle.kts <<'EOF_PAI'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PersonalAI"
+          include(":app")
+          EOF_PAI
+          mkdir -p .
+          cat > build.gradle.kts <<'EOF_PAI'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_PAI
+          mkdir -p .
+          cat > gradle.properties <<'EOF_PAI'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          kotlin.code.style=official
+          EOF_PAI
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_PAI'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.personalai"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.personalai"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF_PAI
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_PAI'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+              <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.speech.RecognitionService" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Personal AI"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AssistantService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+
+                  <service
+                      android:name=".PhoneControlService"
+                      android:exported="true"
+                      android:label="Personal AI"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_PAI
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_PAI'
+          <resources>
+              <string name="acc_desc">Personal AI aapke bolne par screen padhta hai aur tap, type ya scroll karta hai.</string>
+          </resources>
+          EOF_PAI
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_PAI'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100"
+              android:description="@string/acc_desc" />
+          EOF_PAI
+          mkdir -p app/src/main/java/com/example/personalai
+          cat > app/src/main/java/com/example/personalai/Prefs.kt <<'EOF_PAI'
+          package com.example.personalai
+
+          import android.content.Context
+
+          object Prefs {
+              fun sp(c: Context) = c.getSharedPreferences("personal_ai", Context.MODE_PRIVATE)
+
+              fun apiKey(c: Context): String = sp(c).getString("key", "") ?: ""
+
+              fun model(c: Context): String {
+                  val m = (sp(c).getString("model", "") ?: "").trim()
+                  return if (m.isEmpty()) "gemini-3.5-flash" else m
+              }
+
+              // AI ka naam jo aapne rakha hai
+              fun aiName(c: Context): String {
+                  val n = (sp(c).getString("ai_name", "") ?: "").trim()
+                  return if (n.isEmpty()) "Jarvis" else n
+              }
+
+              // "Naam sikhao" se sune hue roop (Hindi / English spelling)
+              fun learned(c: Context): List<String> =
+                  (sp(c).getString("learned", "") ?: "").split(",").map { it.trim() }.filter { it.isNotEmpty() }
+
+              // Bulane par in shabdon ko naam maana jayega
+              fun names(c: Context): List<String> =
+                  (listOf(aiName(c).lowercase()) + learned(c)).map { it.trim() }.filter { it.length >= 2 }.distinct()
+
+              fun addLearned(c: Context, items: List<String>) {
+                  val fresh = items.map { it.replace(",", " ").trim().lowercase() }.filter { it.length >= 2 }
+                  val all = (learned(c) + fresh).distinct().take(8)
+                  sp(c).edit().putString("learned", all.joinToString(",")).apply()
+              }
+
+              fun clearLearned(c: Context) {
+                  sp(c).edit().putString("learned", "").apply()
+              }
+
+              fun rate(c: Context): Float = sp(c).getFloat("rate", 1.0f)
+              fun pitch(c: Context): Float = sp(c).getFloat("pitch", 1.0f)
+          }
+          EOF_PAI
+          mkdir -p app/src/main/java/com/example/personalai
+          cat > app/src/main/java/com/example/personalai/MainActivity.kt <<'EOF_PAI'
+          package com.example.personalai
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private lateinit var nameBox: EditText
+              private lateinit var keyBox: EditText
+              private lateinit var modelBox: EditText
+              private lateinit var rateBar: SeekBar
+              private lateinit var pitchBar: SeekBar
+              private var learner: SpeechRecognizer? = null
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(40, 40, 40, 40)
+                  }
+                  setContentView(ScrollView(this).apply { addView(root) })
+
+                  fun label(t: String) = TextView(this).apply { text = t; textSize = 15f; setPadding(0, 28, 0, 6) }
+                  fun button(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }
+
+                  root.addView(TextView(this).apply { text = "Personal AI"; textSize = 24f })
+
+                  root.addView(label("1. à¤…à¤ªà¤¨à¥‡ AI à¤•à¤¾ à¤¨à¤¾à¤® (à¤œà¥‹ à¤®à¤¨ à¤šà¤¾à¤¹à¥‡ à¤°à¤–à¥‹)"))
+                  nameBox = EditText(this).apply { setText(Prefs.aiName(this@MainActivity)) }
+                  root.addView(nameBox)
+                  root.addView(button("à¤¨à¤¾à¤® à¤¸à¤¿à¤–à¤¾à¤“ (à¤¬à¤Ÿà¤¨ à¤¦à¤¬à¤¾à¤•à¤° à¤¸à¤¿à¤°à¥à¤«à¤¼ à¤¨à¤¾à¤® à¤¬à¥‹à¤²à¥‹)") { learnName() })
+                  root.addView(button("à¤¸à¤¿à¤–à¤¾à¤ à¤¹à¥à¤ à¤°à¥‚à¤ª à¤®à¤¿à¤Ÿà¤¾à¤“") {
+                      Prefs.clearLearned(this)
+                      Toast.makeText(this, "à¤®à¤¿à¤Ÿà¤¾ à¤¦à¤¿à¤", Toast.LENGTH_SHORT).show()
+                  })
+
+                  root.addView(label("2. Gemini API key (aistudio.google.com à¤¸à¥‡, free)"))
+                  keyBox = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                      setText(Prefs.apiKey(this@MainActivity))
+                  }
+                  root.addView(keyBox)
+
+                  root.addView(label("à¤®à¥‰à¤¡à¤² (error à¤¯à¤¾ limit à¤†à¤ à¤¤à¥‹ gemini-3.5-flash-lite à¤²à¤¿à¤–à¥‹)"))
+                  modelBox = EditText(this).apply { setText(Prefs.model(this@MainActivity)) }
+                  root.addView(modelBox)
+
+                  root.addView(label("3. à¤¬à¥‹à¤²à¤¨à¥‡ à¤•à¥€ à¤¸à¥à¤ªà¥€à¤¡"))
+                  rateBar = SeekBar(this).apply {
+                      max = 150
+                      progress = ((Prefs.rate(this@MainActivity) - 0.5f) * 100).toInt()
+                  }
+                  root.addView(rateBar)
+
+                  root.addView(label("à¤†à¤µà¤¾à¤œà¤¼ à¤•à¥€ pitch (à¤ªà¤¤à¤²à¥€ / à¤­à¤¾à¤°à¥€)"))
+                  pitchBar = SeekBar(this).apply {
+                      max = 150
+                      progress = ((Prefs.pitch(this@MainActivity) - 0.5f) * 100).toInt()
+                  }
+                  root.addView(pitchBar)
+
+                  root.addView(button("à¤¦à¥‚à¤¸à¤°à¥€ à¤†à¤µà¤¾à¤œà¤¼ à¤šà¥à¤¨à¥‹ (à¤«à¤¼à¥‹à¤¨ à¤•à¥€ TTS settings)") {
+                      try {
+                          startActivity(Intent("com.android.settings.TTS_SETTINGS"))
+                      } catch (e: Exception) {
+                          startActivity(Intent(Settings.ACTION_SETTINGS))
+                      }
+                  })
+
+                  root.addView(label("4. à¤ªà¤¹à¤²à¥€ à¤¬à¤¾à¤° à¤¯à¥‡ 3 permissions à¤¦à¥‹:"))
+                  root.addView(button("(a) Accessibility à¤šà¤¾à¤²à¥‚ à¤•à¤°à¥‹ (Personal AI)") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+                  root.addView(button("(b) Display over other apps allow à¤•à¤°à¥‹") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  })
+                  root.addView(button("(c) Battery restriction à¤¹à¤Ÿà¤¾à¤“") {
+                      startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                  })
+
+                  root.addView(label("5. à¤…à¤¬ à¤šà¤¾à¤²à¥‚ à¤•à¤°à¥‹"))
+                  root.addView(button("START (à¤¸à¥à¤¨à¤¨à¤¾ à¤¶à¥à¤°à¥‚ à¤•à¤°à¥‹)") { saveAndStart() })
+                  root.addView(button("STOP") {
+                      stopService(Intent(this, AssistantService::class.java))
+                      Toast.makeText(this, "à¤¬à¤‚à¤¦ à¤•à¤° à¤¦à¤¿à¤¯à¤¾", Toast.LENGTH_SHORT).show()
+                  })
+              }
+
+              private fun save() {
+                  val sp = Prefs.sp(this)
+                  val oldName = Prefs.aiName(this)
+                  val newName = nameBox.text.toString().trim().ifEmpty { "Jarvis" }
+                  val e = sp.edit()
+                      .putString("ai_name", newName)
+                      .putString("key", keyBox.text.toString().trim())
+                      .putString("model", modelBox.text.toString().trim())
+                      .putFloat("rate", 0.5f + rateBar.progress / 100f)
+                      .putFloat("pitch", 0.5f + pitchBar.progress / 100f)
+                  if (!newName.equals(oldName, ignoreCase = true)) e.putString("learned", "")
+                  e.apply()
+              }
+
+              private fun learnName() {
+                  save()
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
+                      return
+                  }
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      Toast.makeText(this, "Speech recognition à¤¨à¤¹à¥€à¤‚ à¤®à¤¿à¤²à¤¾ (Google app à¤šà¤¾à¤¹à¤¿à¤)", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  stopService(Intent(this, AssistantService::class.java))
+                  learner?.destroy()
+                  val r = SpeechRecognizer.createSpeechRecognizer(this)
+                  r.setRecognitionListener(object : RecognitionListener {
+                      override fun onReadyForSpeech(params: Bundle?) {}
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(rmsdB: Float) {}
+                      override fun onBufferReceived(buffer: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onPartialResults(partialResults: Bundle?) {}
+                      override fun onEvent(eventType: Int, params: Bundle?) {}
+                      override fun onError(error: Int) {
+                          Toast.makeText(this@MainActivity, "à¤¸à¥à¤¨ à¤¨à¤¹à¥€à¤‚ à¤ªà¤¾à¤¯à¤¾, à¤«à¤¿à¤° à¤¸à¥‡ à¤•à¥‹à¤¶à¤¿à¤¶ à¤•à¤°à¥‹", Toast.LENGTH_LONG).show()
+                      }
+
+                      override fun onResults(results: Bundle?) {
+                          val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: arrayListOf()
+                          Prefs.addLearned(this@MainActivity, list)
+                          Toast.makeText(this@MainActivity, "à¤¸à¥€à¤–à¤¾: " + list.joinToString(", "), Toast.LENGTH_LONG).show()
+                      }
+                  })
+                  learner = r
+                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
+                      .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+                  Toast.makeText(this, "à¤…à¤¬ à¤¸à¤¿à¤°à¥à¤«à¤¼ à¤…à¤ªà¤¨à¥‡ AI à¤•à¤¾ à¤¨à¤¾à¤® à¤¬à¥‹à¤²à¥‹", Toast.LENGTH_LONG).show()
+                  r.startListening(i)
+              }
+
+              private fun saveAndStart() {
+                  save()
+                  val perms = mutableListOf(
+                      Manifest.permission.RECORD_AUDIO,
+                      Manifest.permission.CALL_PHONE,
+                      Manifest.permission.READ_CONTACTS
+                  )
+                  if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
+                  val missing = perms.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                  if (missing.isEmpty()) startAssistant() else requestPermissions(missing.toTypedArray(), 1)
+              }
+
+              private fun startAssistant() {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      Toast.makeText(this, "Microphone permission à¤œà¤¼à¤°à¥‚à¤°à¥€ à¤¹à¥ˆ", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  startForegroundService(Intent(this, AssistantService::class.java))
+                  Toast.makeText(this, "à¤šà¤¾à¤²à¥‚ à¤¹à¥‹ à¤—à¤¯à¤¾à¥¤ ${Prefs.aiName(this)} à¤•à¤¹à¤•à¤° à¤¬à¥à¤²à¤¾à¤“à¥¤", Toast.LENGTH_LONG).show()
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == 1) {
+                      startAssistant()
+                  } else if (requestCode == 2 && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                      learnName()
+                  }
+              }
+
+              override fun onDestroy() {
+                  learner?.destroy()
+                  super.onDestroy()
+              }
+          }
+          EOF_PAI
+          mkdir -p app/src/main/java/com/example/personalai
+          cat > app/src/main/java/com/example/personalai/AssistantService.kt <<'EOF_PAI'
+          package com.example.personalai
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.speech.
